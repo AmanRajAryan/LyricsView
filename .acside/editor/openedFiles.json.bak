@@ -1,0 +1,20 @@
+{
+  "allFiles": [
+    {
+      "file": "/storage/emulated/0/AndroidIDEProjects/LyricsView/app/src/main/java/aman/lyricsview/LrcParser.java",
+      "selection": {
+        "end": {
+          "column": 23,
+          "index": 23,
+          "line": 0
+        },
+        "start": {
+          "column": 13,
+          "index": 13,
+          "line": 0
+        }
+      }
+    }
+  ],
+  "selectedFile": "/storage/emulated/0/AndroidIDEProjects/LyricsView/app/src/main/java/aman/lyricsview/LrcParser.java"
+}

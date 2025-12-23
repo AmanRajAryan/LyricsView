@@ -1,6 +1,7 @@
 package aman.lyricsview;
 
 import android.content.Context;
+import android.content.res.TypedArray;
 import android.graphics.BlurMaskFilter;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -9,6 +10,8 @@ import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Shader;
 import android.graphics.Typeface;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.AttributeSet;
 import android.view.GestureDetector;
 import android.view.MotionEvent;
@@ -20,18 +23,35 @@ import android.widget.OverScroller;
 import androidx.annotation.Nullable;
 
 import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
-public class SyncedLyricsView extends View {
+public class LyricsView extends View {
 
     public interface SeekListener {
         void onSeek(long timeMs);
     }
 
+    private static class WrappedLine {
+        LyricLine parentLine;
+        List<LyricWord> words;
+        float y;
+        long nextStartTime = -1;
+        float xOffset = 0;
+
+        WrappedLine(LyricLine parentLine, List<LyricWord> words) {
+            this.parentLine = parentLine;
+            this.words = words;
+        }
+    }
+
+    // DATA
     private List<LyricLine> lyrics = new ArrayList<>();
     private List<WrappedLine> wrappedLines = new ArrayList<>();
     private Map<LyricLine, Float> lineCenterYMap = new HashMap<>();
@@ -39,32 +59,53 @@ public class SyncedLyricsView extends View {
 
     private long currentTime = 0;
 
+    // THREADING
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService parsingExecutor = Executors.newSingleThreadExecutor();
+
+    // PAINTS
     private Paint paintActive, paintDefault, paintPast;
-    private Paint paintFps;
-
     private Paint paintFill, paintBloom;
-    private LinearGradient masterGradient;
-
     private Paint paintFillV2, paintBloomV2;
-    private LinearGradient masterGradientV2;
-    private final int COLOR_V2 = Color.parseColor("#00E5FF");
+    private Paint paintEmpty;
 
+    // PAINTS - BACKGROUND VOCALS
+    private Paint paintActiveBG, paintDefaultBG;
+    private Paint paintFillBG, paintBloomBG;
+    private Paint paintFillV2BG, paintBloomV2BG;
+
+    private Paint paintFps;
+    private LinearGradient masterGradient;
+    private LinearGradient masterGradientV2;
     private Matrix shaderMatrix = new Matrix();
     private BlurMaskFilter bgBlurFilter;
 
-    private float textHeight;
+    // CONFIGURABLE ATTRIBUTES
     private float baseTextSize;
-    private static final float LAYOUT_SCALE = 1.1f;
-    private static final float INACTIVE_SCALE = 0.9f;
+    private float activeTextScale;
+    private float padding;
+    private float spacingBetweenWrappedLines;
+    private float spacingBetweenLyrics;
+    private float bgVocalBlurRadius;
 
-    // --- BG VOCAL CONFIG ---
+    private int colorActive;
+    private int colorInactive;
+    private int colorPast;
+    private int colorSecondaryVocal;
+
+    // NEW ATTRIBUTES
+    private int textGravity; // 0=Center, 1=Start
+    private float biasY;     // 0.5f=Center
+    private boolean isScrollEnabled = true;
+    private String emptyMessage = "No Lyrics";
+    private int emptyColor;
+
+    // CONSTANTS
+    private static final float INACTIVE_SCALE = 0.9f;
     private static final float BG_SCALE_SIZE = 0.85f;
     private static final float BG_HORIZONTAL_STRETCH = 1.25f;
 
-    private float padding = 48;
-    private float spacingBetweenWrappedLines;
-    private float spacingBetweenLyrics;
-
+    // SCROLLING & GESTURES
     private float targetScrollY = 0;
     private float currentScrollY = 0;
     private float minScrollY = 0;
@@ -85,10 +126,13 @@ public class SyncedLyricsView extends View {
     private static final long SCROLL_ANTICIPATION_MS = 600;
     private static final long DECAY_DURATION_MS = 400;
 
+    private float textHeight;
+    private float totalContentHeight = 0;
+
+    // DEBUG FPS
     private long lastFpsTime = 0;
     private int frameCount = 0;
     private int currentFps = 0;
-    private float totalContentHeight = 0;
 
     private int currentFontIndex = 0;
     private static final Typeface[] FONTS = {
@@ -103,44 +147,93 @@ public class SyncedLyricsView extends View {
         "Default", "Serif", "Sans Serif", "Monospace", "Cursive", "Casual"
     };
 
-    private Map<String, Float> wordWidthCache = new HashMap<>();
-
-    public SyncedLyricsView(Context context) {
+    public LyricsView(Context context) {
         this(context, null);
     }
 
-    public SyncedLyricsView(Context context, @Nullable AttributeSet attrs) {
+    public LyricsView(Context context, @Nullable AttributeSet attrs) {
         this(context, attrs, 0);
     }
 
-    public SyncedLyricsView(Context context, @Nullable AttributeSet attrs, int defStyleAttr) {
+    public LyricsView(Context context, @Nullable AttributeSet attrs, int defStyleAttr) {
         super(context, attrs, defStyleAttr);
-        init(context);
+        init(context, attrs);
     }
 
-    private void init(Context context) {
+    private void init(Context context, @Nullable AttributeSet attrs) {
         float density = getResources().getDisplayMetrics().scaledDensity;
-        baseTextSize = 32 * density;
-        float layoutTextSize = baseTextSize * LAYOUT_SCALE;
 
+        // 1. Set Defaults
+        baseTextSize = 32 * density;
+        activeTextScale = 1.1f;
+        padding = 48;
         spacingBetweenWrappedLines = 10 * density;
         spacingBetweenLyrics = 60 * density;
+        bgVocalBlurRadius = 5f * density;
+        
+        colorActive = Color.WHITE;
+        colorInactive = Color.argb(102, 255, 255, 255);
+        colorPast = Color.argb(80, 255, 255, 255);
+        colorSecondaryVocal = Color.parseColor("#00E5FF");
+        
+        textGravity = 0; // Center
+        biasY = 0.5f;    // Center vertical
+        isScrollEnabled = true;
+        emptyColor = colorInactive;
 
-        bgBlurFilter = new BlurMaskFilter(10f * density / 3f, BlurMaskFilter.Blur.NORMAL);
+        // 2. Parse XML Attributes
+        if (attrs != null) {
+            TypedArray ta = context.obtainStyledAttributes(attrs, R.styleable.LyricsView);
+            try {
+                baseTextSize = ta.getDimension(R.styleable.LyricsView_lyricsTextSize, baseTextSize);
+                activeTextScale = ta.getFloat(R.styleable.LyricsView_lyricsActiveTextScale, activeTextScale);
+                
+                colorActive = ta.getColor(R.styleable.LyricsView_lyricsColorActive, colorActive);
+                colorInactive = ta.getColor(R.styleable.LyricsView_lyricsColorInactive, colorInactive);
+                colorPast = ta.getColor(R.styleable.LyricsView_lyricsColorSyncedPast, colorPast);
+                colorSecondaryVocal = ta.getColor(R.styleable.LyricsView_lyricsColorSecondaryVocal, colorSecondaryVocal);
+                
+                padding = ta.getDimension(R.styleable.LyricsView_lyricsLayoutPadding, padding);
+                spacingBetweenLyrics = ta.getDimension(R.styleable.LyricsView_lyricsLineSpacing, spacingBetweenLyrics);
+                spacingBetweenWrappedLines = ta.getDimension(R.styleable.LyricsView_lyricsWordWrapSpacing, spacingBetweenWrappedLines);
+                bgVocalBlurRadius = ta.getDimension(R.styleable.LyricsView_lyricsBackgroundVocalBlurRadius, bgVocalBlurRadius);
+                
+                textGravity = ta.getInt(R.styleable.LyricsView_lyricsGravity, textGravity);
+                biasY = ta.getFloat(R.styleable.LyricsView_lyricsBiasY, biasY);
+                isScrollEnabled = ta.getBoolean(R.styleable.LyricsView_lyricsEnableScroll, isScrollEnabled);
+                
+                String emptyMsg = ta.getString(R.styleable.LyricsView_lyricsEmptyMessage);
+                if (emptyMsg != null) emptyMessage = emptyMsg;
+                emptyColor = ta.getColor(R.styleable.LyricsView_lyricsEmptyColor, emptyColor);
+                
+            } finally {
+                ta.recycle();
+            }
+        }
 
+        float layoutTextSize = baseTextSize * activeTextScale;
+        
+        // SAFETY CHECK: Blur radius must be > 0 to avoid crash
+        if (bgVocalBlurRadius > 0) {
+            bgBlurFilter = new BlurMaskFilter(bgVocalBlurRadius, BlurMaskFilter.Blur.NORMAL);
+        } else {
+            bgBlurFilter = null;
+        }
+
+        // 3. Initialize Paints
         paintActive = new Paint(Paint.ANTI_ALIAS_FLAG);
         paintActive.setTextSize(layoutTextSize);
-        paintActive.setColor(Color.WHITE);
+        paintActive.setColor(colorActive);
         paintActive.setFakeBoldText(true);
 
         paintDefault = new Paint(Paint.ANTI_ALIAS_FLAG);
         paintDefault.setTextSize(layoutTextSize);
-        paintDefault.setColor(Color.argb(102, 255, 255, 255));
+        paintDefault.setColor(colorInactive);
         paintDefault.setFakeBoldText(true);
 
         paintPast = new Paint(Paint.ANTI_ALIAS_FLAG);
         paintPast.setTextSize(layoutTextSize);
-        paintPast.setColor(Color.argb(80, 255, 255, 255));
+        paintPast.setColor(colorPast);
         paintPast.setFakeBoldText(true);
 
         paintFill = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -150,7 +243,7 @@ public class SyncedLyricsView extends View {
         paintBloom = new Paint(Paint.ANTI_ALIAS_FLAG);
         paintBloom.setTextSize(layoutTextSize);
         paintBloom.setFakeBoldText(true);
-        paintBloom.setShadowLayer(25, 0, 0, Color.WHITE);
+        paintBloom.setShadowLayer(25, 0, 0, colorActive);
 
         paintFillV2 = new Paint(Paint.ANTI_ALIAS_FLAG);
         paintFillV2.setTextSize(layoutTextSize);
@@ -159,7 +252,38 @@ public class SyncedLyricsView extends View {
         paintBloomV2 = new Paint(Paint.ANTI_ALIAS_FLAG);
         paintBloomV2.setTextSize(layoutTextSize);
         paintBloomV2.setFakeBoldText(true);
-        paintBloomV2.setShadowLayer(25, 0, 0, COLOR_V2);
+        paintBloomV2.setShadowLayer(25, 0, 0, colorSecondaryVocal);
+
+        paintEmpty = new Paint(Paint.ANTI_ALIAS_FLAG);
+        paintEmpty.setColor(emptyColor);
+        paintEmpty.setTextSize(baseTextSize);
+        paintEmpty.setFakeBoldText(true);
+        paintEmpty.setTextAlign(Paint.Align.CENTER);
+
+        // --- BG Paints ---
+        paintActiveBG = new Paint(paintActive);
+        paintActiveBG.setMaskFilter(bgBlurFilter);
+        paintActiveBG.setTextScaleX(BG_HORIZONTAL_STRETCH);
+
+        paintDefaultBG = new Paint(paintDefault);
+        paintDefaultBG.setMaskFilter(bgBlurFilter);
+        paintDefaultBG.setTextScaleX(BG_HORIZONTAL_STRETCH);
+
+        paintFillBG = new Paint(paintFill);
+        paintFillBG.setMaskFilter(bgBlurFilter);
+        paintFillBG.setTextScaleX(BG_HORIZONTAL_STRETCH);
+
+        paintBloomBG = new Paint(paintBloom);
+        paintBloomBG.setMaskFilter(bgBlurFilter);
+        paintBloomBG.setTextScaleX(BG_HORIZONTAL_STRETCH);
+
+        paintFillV2BG = new Paint(paintFillV2);
+        paintFillV2BG.setMaskFilter(bgBlurFilter);
+        paintFillV2BG.setTextScaleX(BG_HORIZONTAL_STRETCH);
+
+        paintBloomV2BG = new Paint(paintBloomV2);
+        paintBloomV2BG.setMaskFilter(bgBlurFilter);
+        paintBloomV2BG.setTextScaleX(BG_HORIZONTAL_STRETCH);
 
         paintFps = new Paint(Paint.ANTI_ALIAS_FLAG);
         paintFps.setColor(Color.GREEN);
@@ -174,22 +298,18 @@ public class SyncedLyricsView extends View {
         minFlingVelocity = vc.getScaledMinimumFlingVelocity();
         maxFlingVelocity = vc.getScaledMaximumFlingVelocity();
 
-        resumeAutoScrollRunnable =
-                () -> {
-                    isUserScrolling = false;
-                    isFlinging = false;
-                    postInvalidateOnAnimation();
-                };
+        resumeAutoScrollRunnable = () -> {
+            isUserScrolling = false;
+            isFlinging = false;
+            postInvalidateOnAnimation();
+        };
 
-        gestureDetector =
-                new GestureDetector(
-                        context,
-                        new GestureDetector.SimpleOnGestureListener() {
-                            @Override
-                            public boolean onSingleTapUp(MotionEvent e) {
-                                return handleTap(e.getY());
-                            }
-                        });
+        gestureDetector = new GestureDetector(context, new GestureDetector.SimpleOnGestureListener() {
+            @Override
+            public boolean onSingleTapUp(MotionEvent e) {
+                return handleTap(e.getY());
+            }
+        });
 
         setLayerType(LAYER_TYPE_HARDWARE, null);
     }
@@ -206,42 +326,82 @@ public class SyncedLyricsView extends View {
     public String cycleFont() {
         currentFontIndex = (currentFontIndex + 1) % FONTS.length;
         Typeface tf = Typeface.create(FONTS[currentFontIndex], Typeface.BOLD);
-        float layoutTextSize = baseTextSize * LAYOUT_SCALE;
+        float layoutTextSize = baseTextSize * activeTextScale;
 
-        paintActive.setTypeface(tf);
-        paintActive.setTextSize(layoutTextSize);
-        paintDefault.setTypeface(tf);
-        paintDefault.setTextSize(layoutTextSize);
-        paintPast.setTypeface(tf);
-        paintPast.setTextSize(layoutTextSize);
-        paintFill.setTypeface(tf);
-        paintFill.setTextSize(layoutTextSize);
-        paintBloom.setTypeface(tf);
-        paintBloom.setTextSize(layoutTextSize);
-        paintFillV2.setTypeface(tf);
-        paintFillV2.setTextSize(layoutTextSize);
-        paintBloomV2.setTypeface(tf);
-        paintBloomV2.setTextSize(layoutTextSize);
+        paintActive.setTypeface(tf); paintActive.setTextSize(layoutTextSize);
+        paintDefault.setTypeface(tf); paintDefault.setTextSize(layoutTextSize);
+        paintPast.setTypeface(tf); paintPast.setTextSize(layoutTextSize);
+        paintFill.setTypeface(tf); paintFill.setTextSize(layoutTextSize);
+        paintBloom.setTypeface(tf); paintBloom.setTextSize(layoutTextSize);
+        paintFillV2.setTypeface(tf); paintFillV2.setTextSize(layoutTextSize);
+        paintBloomV2.setTypeface(tf); paintBloomV2.setTextSize(layoutTextSize);
+        paintEmpty.setTypeface(tf); // Update empty paint font too
+
+        paintActiveBG.setTypeface(tf); paintActiveBG.setTextSize(layoutTextSize);
+        paintDefaultBG.setTypeface(tf); paintDefaultBG.setTextSize(layoutTextSize);
+        paintFillBG.setTypeface(tf); paintFillBG.setTextSize(layoutTextSize);
+        paintBloomBG.setTypeface(tf); paintBloomBG.setTextSize(layoutTextSize);
+        paintFillV2BG.setTypeface(tf); paintFillV2BG.setTextSize(layoutTextSize);
+        paintBloomV2BG.setTypeface(tf); paintBloomV2BG.setTextSize(layoutTextSize);
 
         updateTextHeight();
-        wordWidthCache.clear();
         requestLayout();
         invalidate();
         return FONT_NAMES[currentFontIndex];
     }
 
-    public void setLyrics(String lyricsText) {
-        if (lyricsText == null || lyricsText.isEmpty()) return;
-        ByteArrayInputStream is =
-                new ByteArrayInputStream(lyricsText.getBytes(StandardCharsets.UTF_8));
+    public void setLyrics(@Nullable String lyricsText) {
+        if (lyricsText == null || lyricsText.isEmpty()) {
+            clearLyrics();
+            return;
+        }
+        ByteArrayInputStream is = new ByteArrayInputStream(lyricsText.getBytes(StandardCharsets.UTF_8));
         setLyrics(LrcParser.parse(is));
     }
 
-    public void setLyrics(List<LyricLine> lyrics) {
-        this.lyrics = lyrics;
-        wordWidthCache.clear();
+    public void setLyrics(@Nullable List<LyricLine> lyrics) {
+        if (lyrics == null) {
+            this.lyrics = new ArrayList<>();
+        } else {
+            this.lyrics = lyrics;
+        }
+        
+        wrappedLines.clear();
+        lineCenterYMap.clear();
+        lineScrollYMap.clear();
+        totalContentHeight = 0;
+        currentScrollY = 0;
+        targetScrollY = 0;
+        
         requestLayout();
         invalidate();
+    }
+
+    public void setLyricsAsync(@Nullable final String lyricsText) {
+        if (lyricsText == null || lyricsText.isEmpty()) {
+            clearLyrics();
+            return;
+        }
+        parsingExecutor.execute(() -> {
+            ByteArrayInputStream is = new ByteArrayInputStream(lyricsText.getBytes(StandardCharsets.UTF_8));
+            final List<LyricLine> result = LrcParser.parse(is);
+            mainHandler.post(() -> setLyrics(result));
+        });
+    }
+
+    public void setLyricsAsync(@Nullable final InputStream inputStream) {
+        if (inputStream == null) {
+            clearLyrics();
+            return;
+        }
+        parsingExecutor.execute(() -> {
+            final List<LyricLine> result = LrcParser.parse(inputStream);
+            mainHandler.post(() -> setLyrics(result));
+        });
+    }
+
+    public void clearLyrics() {
+        setLyrics((List<LyricLine>) null);
     }
 
     public void updateTime(long timeMs) {
@@ -294,7 +454,8 @@ public class SyncedLyricsView extends View {
 
             Float preCalcTarget = lineScrollYMap.get(currentLine);
             if (preCalcTarget == null) preCalcTarget = 0f;
-            float desiredY = preCalcTarget - getHeight() / 2f;
+            
+            float desiredY = preCalcTarget - (getHeight() * biasY);
 
             if (effectiveIndex + 1 < lyrics.size()) {
                 LyricLine nextLine = lyrics.get(effectiveIndex + 1);
@@ -304,7 +465,7 @@ public class SyncedLyricsView extends View {
                         float ratio = 1f - ((float) timeUntilNext / SCROLL_ANTICIPATION_MS);
                         Float nextPreCalcTarget = lineScrollYMap.get(nextLine);
                         if (nextPreCalcTarget != null) {
-                            float nextTargetY = nextPreCalcTarget - getHeight() / 2f;
+                            float nextTargetY = nextPreCalcTarget - (getHeight() * biasY);
                             desiredY = desiredY + (nextTargetY - desiredY) * ratio;
                         }
                     }
@@ -337,24 +498,10 @@ public class SyncedLyricsView extends View {
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         super.onSizeChanged(w, h, oldw, oldh);
         if (w > 0) {
-            masterGradient =
-                    new LinearGradient(
-                            0,
-                            0,
-                            100,
-                            0,
-                            new int[] {Color.WHITE, Color.TRANSPARENT},
-                            null,
-                            Shader.TileMode.CLAMP);
-            masterGradientV2 =
-                    new LinearGradient(
-                            0,
-                            0,
-                            100,
-                            0,
-                            new int[] {COLOR_V2, Color.TRANSPARENT},
-                            null,
-                            Shader.TileMode.CLAMP);
+            masterGradient = new LinearGradient(0, 0, 100, 0,
+                    new int[] {colorActive, Color.TRANSPARENT}, null, Shader.TileMode.CLAMP);
+            masterGradientV2 = new LinearGradient(0, 0, 100, 0,
+                    new int[] {colorSecondaryVocal, Color.TRANSPARENT}, null, Shader.TileMode.CLAMP);
         }
         updateScrollBounds(h);
     }
@@ -370,14 +517,6 @@ public class SyncedLyricsView extends View {
         if (maxScrollY < minScrollY) maxScrollY = minScrollY;
     }
 
-    private float getWordWidth(String text) {
-        Float cached = wordWidthCache.get(text);
-        if (cached != null) return cached;
-        float width = paintActive.measureText(text);
-        wordWidthCache.put(text, width);
-        return width;
-    }
-
     private void wrapLines(int viewWidth) {
         wrappedLines.clear();
         lineCenterYMap.clear();
@@ -388,7 +527,6 @@ public class SyncedLyricsView extends View {
 
         float currentY = 0;
         LyricLine previousParent = null;
-        float bgIndent = padding * 2;
 
         for (int lineIdx = 0; lineIdx < lyrics.size(); lineIdx++) {
             LyricLine line = lyrics.get(lineIdx);
@@ -399,8 +537,7 @@ public class SyncedLyricsView extends View {
             float currentLineWidth = 0;
             float parentStartY = -1;
             float parentLastLineY = -1;
-            float effectiveMeasureScale =
-                    line.isBackground ? (BG_SCALE_SIZE * BG_HORIZONTAL_STRETCH) : 1.0f;
+            float effectiveMeasureScale = line.isBackground ? (BG_SCALE_SIZE * BG_HORIZONTAL_STRETCH) : 1.0f;
 
             int i = 0;
             while (i < line.words.size()) {
@@ -408,47 +545,31 @@ public class SyncedLyricsView extends View {
                 float clusterWidth = 0;
 
                 LyricWord firstPiece = line.words.get(i);
+                firstPiece.width = paintActive.measureText(firstPiece.text);
+                
                 cluster.add(firstPiece);
-                clusterWidth += getWordWidth(firstPiece.text) * effectiveMeasureScale;
+                clusterWidth += firstPiece.width * effectiveMeasureScale;
                 i++;
 
                 while (i < line.words.size()) {
                     LyricWord lastAdded = cluster.get(cluster.size() - 1);
-                    if (lastAdded.text.endsWith(" ") || lastAdded.text.endsWith("\u3000")) break;
+                    if (lastAdded.text.endsWith(" ") || lastAdded.text.endsWith("\u3000") || lastAdded.text.endsWith("-")) {
+                        break;
+                    }
                     LyricWord nextPiece = line.words.get(i);
+                    nextPiece.width = paintActive.measureText(nextPiece.text);
                     cluster.add(nextPiece);
-                    clusterWidth += getWordWidth(nextPiece.text) * effectiveMeasureScale;
+                    clusterWidth += nextPiece.width * effectiveMeasureScale;
                     i++;
                 }
 
-                if (currentLineWidth + clusterWidth > maxAllowedWidth
-                        && !currentLineWords.isEmpty()) {
-                    WrappedLine wl = new WrappedLine(line, new ArrayList<>(currentLineWords));
-
-                    if (line.isBackground) wl.xOffset = bgIndent;
-                    else wl.xOffset = 0;
-
-                    float spacing;
-                    if (previousParent == null) spacing = 0;
-                    else if (line.isBackground) spacing = 0;
-                    else if (previousParent.isBackground) spacing = 0;
-                    else
-                        spacing =
-                                (previousParent == line)
-                                        ? spacingBetweenWrappedLines
-                                        : spacingBetweenLyrics;
-
-                    currentY += spacing;
-                    if (parentStartY == -1) parentStartY = currentY;
-
-                    wl.y = currentY;
-                    wl.nextStartTime = nextStartTime;
-                    wrappedLines.add(wl);
-
+                if (currentLineWidth + clusterWidth > maxAllowedWidth && !currentLineWords.isEmpty()) {
+                    createWrappedLine(viewWidth, line, nextStartTime, currentLineWords, currentLineWidth, previousParent, currentY);
+                    
+                    if (parentStartY == -1) parentStartY = currentY + getSpacing(line, previousParent);
+                    currentY += getSpacing(line, previousParent);
                     parentLastLineY = currentY;
-
-                    if (line.isBackground) currentY += textHeight * BG_SCALE_SIZE;
-                    else currentY += textHeight;
+                    currentY += (line.isBackground ? textHeight * BG_SCALE_SIZE : textHeight);
 
                     previousParent = line;
                     currentLineWords.clear();
@@ -459,33 +580,12 @@ public class SyncedLyricsView extends View {
             }
 
             if (!currentLineWords.isEmpty()) {
-                WrappedLine wl = new WrappedLine(line, new ArrayList<>(currentLineWords));
+                createWrappedLine(viewWidth, line, nextStartTime, currentLineWords, currentLineWidth, previousParent, currentY);
 
-                if (line.isBackground) wl.xOffset = bgIndent;
-                else wl.xOffset = 0;
-
-                float spacing;
-                if (previousParent == null) spacing = 0;
-                else if (line.isBackground) spacing = 0;
-                else if (previousParent.isBackground) spacing = 0;
-                else
-                    spacing =
-                            (previousParent == line)
-                                    ? spacingBetweenWrappedLines
-                                    : spacingBetweenLyrics;
-
-                currentY += spacing;
-                if (parentStartY == -1) parentStartY = currentY;
-
-                wl.y = currentY;
-                wl.nextStartTime = nextStartTime;
-                wrappedLines.add(wl);
-
+                if (parentStartY == -1) parentStartY = currentY + getSpacing(line, previousParent);
+                currentY += getSpacing(line, previousParent);
                 parentLastLineY = currentY;
-
-                if (line.isBackground) currentY += textHeight * BG_SCALE_SIZE;
-                else currentY += textHeight;
-
+                currentY += (line.isBackground ? textHeight * BG_SCALE_SIZE : textHeight);
                 previousParent = line;
             }
 
@@ -495,7 +595,38 @@ public class SyncedLyricsView extends View {
             }
         }
         totalContentHeight = currentY;
+        calculateScrollTargets();
+    }
+    
+    private float getSpacing(LyricLine line, LyricLine previousParent) {
+         if (previousParent == null) return 0;
+         else if (line.isBackground) return 0;
+         else if (previousParent.isBackground) return 0;
+         else return (previousParent == line) ? spacingBetweenWrappedLines : spacingBetweenLyrics;
+    }
 
+    private void createWrappedLine(int viewWidth, LyricLine line, long nextStartTime, List<LyricWord> words, float lineWidth, LyricLine previousParent, float currentY) {
+         WrappedLine wl = new WrappedLine(line, new ArrayList<>(words));
+         
+         if (line.isBackground) {
+             wl.xOffset = (viewWidth - lineWidth) / 2f - padding;
+         } else {
+             if (textGravity == 1) { 
+                 // Start (Left) Alignment: offset is 0
+                 wl.xOffset = 0; 
+             } else { 
+                 // Center Alignment
+                 wl.xOffset = (viewWidth - lineWidth) / 2f - padding;
+             }
+         }
+
+         float spacing = getSpacing(line, previousParent);
+         wl.y = currentY + spacing;
+         wl.nextStartTime = nextStartTime;
+         wrappedLines.add(wl);
+    }
+
+    private void calculateScrollTargets() {
         for (int i = 0; i < lyrics.size(); i++) {
             LyricLine current = lyrics.get(i);
             Float centerCur = lineCenterYMap.get(current);
@@ -554,6 +685,19 @@ public class SyncedLyricsView extends View {
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
+        
+        // Empty State
+        if (lyrics == null || lyrics.isEmpty()) {
+            if (emptyMessage != null && !emptyMessage.isEmpty()) {
+                 float centerX = getWidth() / 2f;
+                 float centerY = getHeight() / 2f;
+                 // Center vertically based on font metrics
+                 float textY = centerY - ((paintEmpty.descent() + paintEmpty.ascent()) / 2);
+                 canvas.drawText(emptyMessage, centerX, textY, paintEmpty);
+            }
+            return;
+        }
+
         long now = System.currentTimeMillis();
         frameCount++;
         if (now - lastFpsTime >= 1000) {
@@ -561,8 +705,9 @@ public class SyncedLyricsView extends View {
             frameCount = 0;
             lastFpsTime = now;
         }
-
-        if (lyrics.isEmpty() || wrappedLines.isEmpty()) return;
+        
+        if (wrappedLines == null || wrappedLines.isEmpty()) return;
+        
         boolean animatingScroll = updateScrollLogic();
         boolean animatingGlow = false;
 
@@ -571,7 +716,6 @@ public class SyncedLyricsView extends View {
 
         float viewTop = currentScrollY - textHeight;
         float viewBottom = currentScrollY + getHeight();
-        float viewCenterX = getWidth() / 2f;
 
         for (WrappedLine wl : wrappedLines) {
             float y = wl.y;
@@ -585,35 +729,18 @@ public class SyncedLyricsView extends View {
             if (wl.parentLine.isBackground) {
                 targetScale = BG_SCALE_SIZE;
             } else {
-                targetScale =
-                        (INACTIVE_SCALE / LAYOUT_SCALE)
-                                + ((1.0f - (INACTIVE_SCALE / LAYOUT_SCALE)) * focusRatio);
+                targetScale = (INACTIVE_SCALE / activeTextScale) + ((1.0f - (INACTIVE_SCALE / activeTextScale)) * focusRatio);
             }
 
-            if (wl.parentLine.isBackground) {
-                paintActive.setMaskFilter(bgBlurFilter);
-                paintDefault.setMaskFilter(bgBlurFilter);
-                paintFill.setMaskFilter(bgBlurFilter);
-                paintFillV2.setMaskFilter(bgBlurFilter);
-                paintBloom.setMaskFilter(bgBlurFilter);
-                paintBloomV2.setMaskFilter(bgBlurFilter);
-
-                paintActive.setTextScaleX(BG_HORIZONTAL_STRETCH);
-                paintDefault.setTextScaleX(BG_HORIZONTAL_STRETCH);
-                paintFill.setTextScaleX(BG_HORIZONTAL_STRETCH);
-                paintFillV2.setTextScaleX(BG_HORIZONTAL_STRETCH);
-                paintBloom.setTextScaleX(BG_HORIZONTAL_STRETCH);
-                paintBloomV2.setTextScaleX(BG_HORIZONTAL_STRETCH);
-            }
-
-            // --- RESTORED VARIABLES HERE ---
             boolean isPlain = (wl.parentLine.startTime == -1);
-            boolean isTimeActive =
-                    (currentTime >= wl.parentLine.startTime
-                            && currentTime <= wl.parentLine.endTime);
+            boolean isTimeActive = (currentTime >= wl.parentLine.startTime && currentTime <= wl.parentLine.endTime);
             boolean isTimePast = (currentTime > wl.parentLine.endTime);
             boolean isV2 = (wl.parentLine.vocalType == 2);
 
+            Paint currentPaintActive = wl.parentLine.isBackground ? paintActiveBG : paintActive;
+            Paint currentPaintDefault = wl.parentLine.isBackground ? paintDefaultBG : paintDefault;
+            Paint currentPaintFillV2 = wl.parentLine.isBackground ? paintFillV2BG : paintFillV2;
+            
             int targetAlpha = 255;
             if (!wl.parentLine.isBackground) {
                 if (isTimePast && wl.parentLine.startTime != -1) {
@@ -633,40 +760,33 @@ public class SyncedLyricsView extends View {
             canvas.scale(targetScale, targetScale, x, y);
 
             for (LyricWord word : wl.words) {
-                float wordWidth = getWordWidth(word.text);
+                float wordWidth = word.width;
                 if (wl.parentLine.isBackground) wordWidth *= BG_HORIZONTAL_STRETCH;
 
                 int dispersedAlpha = 255;
+
                 if (wl.parentLine.isBackground) {
-                    float wordCenterX = x + wordWidth / 2f;
-                    float dist = Math.abs(wordCenterX - viewCenterX);
-                    float maxDist = getWidth() * 0.9f;
-                    float alphaFactor = 1.0f - (dist / maxDist);
-                    alphaFactor = Math.max(0.15f, Math.min(1f, alphaFactor));
-
-                    float maxDispersedAlpha = 200f;
-                    dispersedAlpha = (int) (maxDispersedAlpha * alphaFactor);
-
-                    paintActive.setAlpha(dispersedAlpha);
-                    paintDefault.setAlpha(dispersedAlpha);
-                    paintFill.setAlpha(dispersedAlpha);
-                    paintFillV2.setAlpha(dispersedAlpha);
-                    paintBloom.setAlpha(dispersedAlpha);
+                    dispersedAlpha = 120;
+                    currentPaintActive.setAlpha(dispersedAlpha);
+                    currentPaintDefault.setAlpha(dispersedAlpha);
+                    
+                    if (wl.parentLine.isBackground) {
+                        paintFillBG.setAlpha(dispersedAlpha);
+                        paintFillV2BG.setAlpha(dispersedAlpha);
+                        paintBloomBG.setAlpha(dispersedAlpha);
+                    }
                 }
 
                 if (isPlain) {
-                    canvas.drawText(word.text, x, y, paintActive);
+                    canvas.drawText(word.text, x, y, currentPaintActive);
                 } else if (isTimeActive && currentTime >= word.time) {
                     if (wl.parentLine.isBackground) {
-                        // --- 90% FADE OUT LOGIC ---
                         float fadeOutFactor = 1.0f;
                         long lineDuration = wl.parentLine.endTime - wl.parentLine.startTime;
                         if (lineDuration > 0) {
                             long lineElapsed = currentTime - wl.parentLine.startTime;
                             float completion = (float) lineElapsed / lineDuration;
-                            // Start fading at 90%
                             if (completion > 0.9f) {
-                                // Map 0.9->1.0 to 1.0->0.0
                                 fadeOutFactor = 1.0f - ((completion - 0.9f) / 0.1f);
                                 fadeOutFactor = Math.max(0f, fadeOutFactor);
                             }
@@ -680,99 +800,83 @@ public class SyncedLyricsView extends View {
                             animatingGlow = true;
                             drawActiveWord(canvas, word, wl, x, y, wordWidth, 255);
                         } else {
-                            if (isV2) canvas.drawText(word.text, x, y, paintFillV2);
-                            else canvas.drawText(word.text, x, y, paintActive);
+                            if (isV2) canvas.drawText(word.text, x, y, currentPaintFillV2);
+                            else canvas.drawText(word.text, x, y, currentPaintActive);
                         }
                     }
                 } else if (isTimeActive) {
-                    canvas.drawText(word.text, x, y, paintDefault);
+                    canvas.drawText(word.text, x, y, currentPaintDefault);
                 } else if (isTimePast) {
                     if (focusRatio > 0.01f) {
-                        Paint activeP = isV2 ? paintActive : paintActive;
-                        if (isV2) activeP.setColor(COLOR_V2);
-                        else activeP.setColor(Color.WHITE);
+                        Paint activeP = currentPaintActive; 
+                        int originalColor = activeP.getColor();
+                        if (isV2) activeP.setColor(colorSecondaryVocal);
+                        else activeP.setColor(colorActive);
 
                         int finalAlpha = targetAlpha;
                         if (wl.parentLine.isBackground) {
-                            finalAlpha =
-                                    (int) ((targetAlpha / 255f) * (dispersedAlpha / 255f) * 255);
+                            finalAlpha = (int) ((targetAlpha / 255f) * (dispersedAlpha / 255f) * 255);
                         }
 
                         activeP.setAlpha(finalAlpha);
                         canvas.drawText(word.text, x, y, activeP);
 
                         activeP.setAlpha(255);
-                        activeP.setColor(Color.WHITE);
+                        activeP.setColor(originalColor);
                     } else {
-                        canvas.drawText(word.text, x, y, paintDefault);
+                        canvas.drawText(word.text, x, y, currentPaintDefault);
                     }
                 } else {
-                    if (!wl.parentLine.isWordSynced
-                            && focusRatio > 0
-                            && !wl.parentLine.isBackground) {
+                    if (!wl.parentLine.isWordSynced && focusRatio > 0 && !wl.parentLine.isBackground) {
                         int futureAlpha = (int) (102 + (255 - 102) * focusRatio);
                         futureAlpha = Math.max(102, Math.min(255, futureAlpha));
-                        paintActive.setAlpha(futureAlpha);
-                        canvas.drawText(word.text, x, y, paintActive);
-                        paintActive.setAlpha(255);
+                        currentPaintActive.setAlpha(futureAlpha);
+                        canvas.drawText(word.text, x, y, currentPaintActive);
+                        currentPaintActive.setAlpha(255);
                     } else {
-                        canvas.drawText(word.text, x, y, paintDefault);
+                        canvas.drawText(word.text, x, y, currentPaintDefault);
                     }
                 }
 
                 if (wl.parentLine.isBackground) {
-                    paintActive.setAlpha(255);
-                    paintDefault.setAlpha(102);
-                    paintFill.setAlpha(255);
-                    paintFillV2.setAlpha(255);
-                    paintBloom.setAlpha(255);
+                    currentPaintActive.setAlpha(255);
+                    currentPaintDefault.setAlpha(102);
+                    paintFillBG.setAlpha(255);
+                    paintFillV2BG.setAlpha(255);
+                    paintBloomBG.setAlpha(255);
                 }
 
                 x += wordWidth;
             }
             canvas.restore();
-
-            if (wl.parentLine.isBackground) {
-                paintActive.setMaskFilter(null);
-                paintDefault.setMaskFilter(null);
-                paintFill.setMaskFilter(null);
-                paintFillV2.setMaskFilter(null);
-                paintBloom.setMaskFilter(null);
-                paintBloomV2.setMaskFilter(null);
-
-                paintActive.setTextScaleX(1.0f);
-                paintDefault.setTextScaleX(1.0f);
-                paintFill.setTextScaleX(1.0f);
-                paintFillV2.setTextScaleX(1.0f);
-                paintBloom.setTextScaleX(1.0f);
-                paintBloomV2.setTextScaleX(1.0f);
-            }
-
+            
             if (focusRatio > 0.0f && focusRatio < 1.0f) {
                 animatingGlow = true;
             }
         }
         canvas.restore();
 
-        canvas.drawText(String.valueOf(currentFps), getWidth() - 50, 100, paintFps);
-
         if (animatingScroll || animatingGlow) {
             postInvalidateOnAnimation();
         }
     }
 
-    private void drawActiveWord(
-            Canvas canvas,
-            LyricWord word,
-            WrappedLine wl,
-            float x,
-            float y,
-            float wordWidth,
-            int alphaOverride) {
+    private void drawActiveWord(Canvas canvas, LyricWord word, WrappedLine wl, float x, float y, float wordWidth, int alphaOverride) {
         boolean isV2 = (wl.parentLine.vocalType == 2);
-        Paint targetFill = isV2 ? paintFillV2 : paintFill;
-        Paint targetBloom = isV2 ? paintBloomV2 : paintBloom;
+        
+        Paint targetFill = isV2 
+                ? (wl.parentLine.isBackground ? paintFillV2BG : paintFillV2) 
+                : (wl.parentLine.isBackground ? paintFillBG : paintFill);
+                
+        Paint targetBloom = isV2 
+                ? (wl.parentLine.isBackground ? paintBloomV2BG : paintBloomV2)
+                : (wl.parentLine.isBackground ? paintBloomBG : paintBloom);
+        
+        if(isV2) targetFill.setColor(colorSecondaryVocal);
+        else targetFill.setColor(colorActive);
+                
         LinearGradient targetGrad = isV2 ? masterGradientV2 : masterGradient;
+        Paint currentDefault = wl.parentLine.isBackground ? paintDefaultBG : paintDefault;
 
         long nextWordTime = wl.parentLine.endTime;
         int wordIndex = wl.parentLine.words.indexOf(word);
@@ -785,10 +889,10 @@ public class SyncedLyricsView extends View {
         long elapsed = currentTime - word.time;
         float progress = Math.min(1.0f, (float) elapsed / duration);
 
-        canvas.drawText(word.text, x, y, paintDefault);
+        canvas.drawText(word.text, x, y, currentDefault);
 
         if (targetGrad != null) {
-            float edgeWidth = 120f;
+            float edgeWidth = Math.min(120f, wordWidth);
             float currentX = x + (wordWidth + edgeWidth) * progress;
 
             shaderMatrix.reset();
@@ -803,37 +907,28 @@ public class SyncedLyricsView extends View {
             if (progress < 1.0f) {
                 float bloomAlpha = 1.0f;
                 if (progress >= 0.7f) {
-                    // Map progress range [0.7, 1.0] to alpha range [1.0, 0.0]
                     bloomAlpha = (1.0f - progress) / (1.0f - 0.7f);
                     bloomAlpha = Math.max(0f, Math.min(1.0f, bloomAlpha));
                 }
 
                 int finalBloomAlpha = (int) (alphaOverride * bloomAlpha);
-
-                // IMPORTANT: Update the shadow layer with the fading alpha
-                int shadowColor = isV2 ? COLOR_V2 : Color.WHITE;
-                int fadedShadowColor =
-                        Color.argb(
-                                finalBloomAlpha,
-                                Color.red(shadowColor),
-                                Color.green(shadowColor),
-                                Color.blue(shadowColor));
+                int shadowColor = isV2 ? colorSecondaryVocal : colorActive;
+                int fadedShadowColor = Color.argb(finalBloomAlpha, Color.red(shadowColor), Color.green(shadowColor), Color.blue(shadowColor));
+                
                 targetBloom.setShadowLayer(25, 0, 0, fadedShadowColor);
-
                 targetBloom.setShader(targetGrad);
                 targetBloom.setAlpha(finalBloomAlpha);
                 canvas.drawText(word.text, x, y, targetBloom);
-
-                // Reset shadow layer after drawing
                 targetBloom.setShadowLayer(25, 0, 0, shadowColor);
             }
-
             targetFill.setAlpha(255);
         }
     }
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
+        if (!isScrollEnabled) return false;
+
         boolean isTap = gestureDetector.onTouchEvent(event);
         if (velocityTracker == null) velocityTracker = VelocityTracker.obtain();
         velocityTracker.addMovement(event);
@@ -864,15 +959,7 @@ public class SyncedLyricsView extends View {
                     float velocityY = velocityTracker.getYVelocity();
                     if (Math.abs(velocityY) > minFlingVelocity) {
                         isFlinging = true;
-                        scroller.fling(
-                                0,
-                                (int) currentScrollY,
-                                0,
-                                (int) -velocityY,
-                                0,
-                                0,
-                                (int) minScrollY,
-                                (int) maxScrollY);
+                        scroller.fling(0, (int) currentScrollY, 0, (int) -velocityY, 0, 0, (int) minScrollY, (int) maxScrollY);
                         postInvalidateOnAnimation();
                     } else {
                         postDelayed(resumeAutoScrollRunnable, AUTO_SCROLL_RESUME_DELAY);
@@ -886,17 +973,12 @@ public class SyncedLyricsView extends View {
         }
         return super.onTouchEvent(event);
     }
-
-    private static class WrappedLine {
-        LyricLine parentLine;
-        List<LyricWord> words;
-        float y;
-        long nextStartTime = -1;
-        float xOffset = 0;
-
-        WrappedLine(LyricLine parentLine, List<LyricWord> words) {
-            this.parentLine = parentLine;
-            this.words = words;
+    
+    @Override
+    protected void onDetachedFromWindow() {
+        super.onDetachedFromWindow();
+        if (parsingExecutor != null && !parsingExecutor.isShutdown()) {
+            parsingExecutor.shutdownNow();
         }
     }
 }

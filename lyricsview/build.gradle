@@ -1,6 +1,7 @@
 plugins {
     id 'com.android.library'
-    id 'maven-publish'
+    // CHANGED: Removed ".base" to enable auto-detection
+    id 'com.vanniktech.maven.publish' 
 }
 
 android {
@@ -11,23 +12,21 @@ android {
         minSdk 21
         targetSdk 34
         versionCode 1
-        versionName '1.0'
-        
-        // Ensures users who obfuscate their apps don't break your library
+        versionName '1.0.2'
         consumerProguardFiles "consumer-rules.pro"
     }
 
-    // --- FIX 1: Prevent NDK Download ---
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             ndk {
-                debugSymbolLevel 'NONE' // <--- This stops the NDK download
+                debugSymbolLevel 'NONE' 
             }
         }
     }
-
+    
+    // ViewBinding is fine to keep if you use it
     buildFeatures {
         viewBinding true
     }
@@ -36,36 +35,43 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-
-    // --- FIX 2: Enable "Release" component for Publishing ---
-    publishing {
-        singleVariant("release") {
-            withSourcesJar() // Optional: lets users see your source code in Android Studio
-        }
-    }
 }
 
-dependencies {
-    // Essential AndroidX dependencies
-    implementation 'androidx.core:core-ktx:1.12.0'
-    implementation 'androidx.appcompat:appcompat:1.6.1'
-    implementation 'com.google.android.material:material:1.11.0'
-    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
-}
+// --- MAVEN CENTRAL CONFIGURATION ---
+mavenPublishing {
+    // 1. Coordinates
+    coordinates("io.github.amanrajaryan", "LyricsView", "1.0.2")
 
-// --- JITPACK PUBLISHING CONFIG ---
-afterEvaluate {
-    publishing {
-        publications {
-            release(MavenPublication) {
-                // This now works because of FIX 2 above
-                from components.release
-                
-                // JitPack follows this format: com.github.User:Repo:Tag
-                groupId = 'com.github.AmanRajAryan' 
-                artifactId = 'LyricsView'
-                version = '1.0.0'
+    // 2. Metadata
+    pom {
+        name.set("LyricsView")
+        description.set("A simple Lyrics View library for Android.")
+        inceptionYear.set("2025")
+        url.set("https://github.com/AmanRajAryan/LyricsView") 
+
+        licenses {
+            license {
+                name.set("The Apache License, Version 2.0")
+                url.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
+                distribution.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
             }
         }
+        developers {
+            developer {
+                id.set("AmanRajAryan") 
+                name.set("Aman Raj Aryan")
+                url.set("https://github.com/AmanRajAryan")
+            }
+        }
+        scm {
+            url.set("https://github.com/AmanRajAryan/LyricsView")
+            connection.set("scm:git:git://github.com/AmanRajAryan/LyricsView.git")
+            developerConnection.set("scm:git:ssh://git@github.com/AmanRajAryan/LyricsView.git")
+        }
     }
+
+    // 3. Target & Signing
+    publishToMavenCentral(com.vanniktech.maven.publish.SonatypeHost.CENTRAL_PORTAL)
+    signAllPublications()
 }
+

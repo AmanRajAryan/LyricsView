@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <declare-styleable name="LyricsView">
+        <attr name="lyricsTextSize" format="dimension" />
+        <attr name="lyricsActiveTextScale" format="float" />
+        
+        <attr name="lyricsGravity" format="enum">
+            <enum name="center" value="0" />
+            <enum name="start" value="1" />
+        </attr>
+
+        <attr name="lyricsColorActive" format="color" />
+        <attr name="lyricsColorInactive" format="color" />
+        <attr name="lyricsColorSyncedPast" format="color" />
+        <attr name="lyricsColorSecondaryVocal" format="color" />
+
+        <attr name="lyricsLayoutPadding" format="dimension" />
+        <attr name="lyricsLineSpacing" format="dimension" />
+        <attr name="lyricsWordWrapSpacing" format="dimension" />
+        
+        <attr name="lyricsBiasY" format="float" />
+
+        <attr name="lyricsBackgroundVocalBlurRadius" format="dimension" />
+
+        <attr name="lyricsEnableScroll" format="boolean" />
+
+        <attr name="lyricsEmptyMessage" format="string" />
+        <attr name="lyricsEmptyColor" format="color" />
+    </declare-styleable>
+</resources>

@@ -1,0 +1,6 @@
+.git/
+build/
+app/build/
+.gradle/
+app/src/main/res/
+key_for_gradle.txt

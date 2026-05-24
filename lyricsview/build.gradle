@@ -1,0 +1,66 @@
+plugins {
+    id 'com.android.library'
+    id 'com.vanniktech.maven.publish.base'
+}
+
+android {
+    namespace 'aman.lyricsview'
+    compileSdk 35
+
+    defaultConfig {
+        minSdk 21
+        targetSdk 34
+        versionCode 1
+        versionName '1.0.0'
+        consumerProguardFiles "consumer-rules.pro"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            ndk {
+                debugSymbolLevel 'NONE'
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+mavenPublishing {
+    coordinates("io.github.AmanRajAryan", "LyricsView", "1.0.0")
+
+    pom {
+        name.set("LyricsView")
+        description.set("A simple Lyrics View library for Android.")
+        inceptionYear.set("2025")
+        url.set("https://github.com/AmanRajAryan/LyricsView") 
+
+        licenses {
+            license {
+                name.set("The Apache License, Version 2.0")
+                url.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
+                distribution.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
+            }
+        }
+        developers {
+            developer {
+                id.set("AmanRajAryan") 
+                name.set("Aman Raj Aryan")
+                url.set("https://github.com/AmanRajAryan")
+            }
+        }
+        scm {
+            url.set("https://github.com/AmanRajAryan/LyricsView")
+            connection.set("scm:git:git://github.com/AmanRajAryan/LyricsView.git")
+            developerConnection.set("scm:git:ssh://git@github.com/AmanRajAryan/LyricsView.git")
+        }
+    }
+
+    publishToMavenCentral(com.vanniktech.maven.publish.SonatypeHost.CENTRAL_PORTAL)
+    signAllPublications()
+}
